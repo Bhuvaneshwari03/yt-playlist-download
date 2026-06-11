@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { spawn } from 'child_process';
+import fs from 'fs-extra';
 import path from 'path';
 
 export async function POST(req: NextRequest) {
@@ -12,7 +13,7 @@ export async function POST(req: NextRequest) {
 
     const scraperPath = path.join(process.cwd(), 'scraper', 'index.ts');
 
-    return new Promise((resolve) => {
+    return new Promise<NextResponse>((resolve) => {
       // Use npx tsx to run the typescript scraper script
       // Wrap arguments in quotes to handle special characters like & in URLs
       const child = spawn('npx', ['tsx', `"${scraperPath}"`, `"${url}"`, `"${type}"`], {
@@ -33,11 +34,25 @@ export async function POST(req: NextRequest) {
         console.error(`Scraper STDERR: ${data}`);
       });
 
-      child.on('close', (code) => {
+      child.on('close', async (code) => {
         console.log(`Scraper process exited with code ${code}`);
         if (code === 0) {
+          const fileMatch = stdout.match(/__FILE__:(.+)/);
+          const filename = fileMatch ? fileMatch[1].trim() : null;
+          let data: { name: string; url: string; status: boolean }[] = [];
+          if (filename) {
+            const filePath = path.join(process.cwd(), 'data', filename);
+            try {
+              const fileContent = await fs.readFile(filePath, 'utf-8');
+              data = JSON.parse(fileContent);
+            } catch (e) {
+              console.error('Failed to read scraped data:', e);
+            }
+          }
           resolve(NextResponse.json({ 
             message: 'Scraping completed successfully', 
+            filename,
+            data,
             output: stdout 
           }));
         } else {

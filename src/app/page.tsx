@@ -1,13 +1,22 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
+
+interface VideoItem {
+  name: string;
+  url: string;
+  status: boolean;
+}
 
 export default function Home() {
   const [url, setUrl] = useState('');
   const [type, setType] = useState<'playlist' | 'video'>('playlist');
   const [loading, setLoading] = useState(false);
+  const [convertingIdx, setConvertingIdx] = useState<number | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [scrapedFile, setScrapedFile] = useState<string | null>(null);
+  const [scrapedData, setScrapedData] = useState<VideoItem[]>([]);
 
   const validateUrl = (input: string) => {
     if (!input) {
@@ -52,6 +61,8 @@ export default function Home() {
 
       if (response.ok) {
         setMessage(data.message);
+        setScrapedFile(data.filename);
+        setScrapedData(data.data || []);
       } else {
         // Handle specific error details from the scraper
         const errorDetail = data.details || data.error;
@@ -71,6 +82,69 @@ export default function Home() {
     }
   };
 
+  const handleConvert = useCallback(async (videoUrl: string, index: number) => {
+    setConvertingIdx(index);
+
+    try {
+      const response = await fetch('/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          videoUrl,
+          jsonFilename: scrapedFile,
+          videoIndex: index,
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || 'Conversion failed');
+      }
+
+      const blob = await response.blob();
+      const contentDisposition = response.headers.get('Content-Disposition');
+      const match = contentDisposition?.match(/filename="?(.+?)"?$/);
+      const fileName = match ? match[1] : `video_${index + 1}.mp3`;
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      setScrapedData(prev => {
+        const next = [...prev];
+        if (next[index]) {
+          next[index] = { ...next[index], status: true };
+        }
+        return next;
+      });
+    } catch (err: any) {
+      setError(err.message || 'Download failed');
+    } finally {
+      setConvertingIdx(null);
+    }
+  }, [scrapedFile]);
+
+  const thStyle: React.CSSProperties = {
+    padding: '12px 16px',
+    textAlign: 'left',
+    fontWeight: '700',
+    color: '#888',
+    fontSize: '12px',
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px'
+  };
+
+  const tdStyle: React.CSSProperties = {
+    padding: '12px 16px',
+    color: '#ccc',
+    borderBottom: '1px solid rgba(255,255,255,0.04)'
+  };
+
   return (
     <div style={{ 
       minHeight: '100vh', 
@@ -78,12 +152,13 @@ export default function Home() {
       backgroundImage: 'radial-gradient(circle at 50% -20%, #1a1a1a 0%, #050505 100%)',
       display: 'flex', 
       justifyContent: 'center', 
-      alignItems: 'center',
+      alignItems: scrapedData.length > 0 ? 'flex-start' : 'center',
       padding: '20px',
       fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
       color: '#ffffff',
       position: 'relative',
-      overflow: 'hidden'
+      overflow: 'hidden',
+      paddingTop: scrapedData.length > 0 ? '40px' : '20px'
     }}>
       {/* Fallback for animation if styled-jsx is problematic */}
       <style dangerouslySetInnerHTML={{ __html: `
@@ -98,7 +173,7 @@ export default function Home() {
 
       <main style={{ 
         width: '100%',
-        maxWidth: '480px',
+        maxWidth: scrapedData.length > 0 ? '900px' : '480px',
         backgroundColor: 'rgba(20, 20, 20, 0.8)',
         backdropFilter: 'blur(20px)',
         borderRadius: '32px',
@@ -259,21 +334,107 @@ export default function Home() {
             >
               {loading ? 'Processing...' : 'Engage Scraper'}
             </button>
+
+
           </div>
 
-          {message && (
-            <div style={{ 
-              marginTop: '32px', 
-              padding: '18px', 
-              backgroundColor: 'rgba(0, 255, 100, 0.05)', 
-              borderRadius: '20px', 
-              color: '#00ff64',
-              fontSize: '14px',
-              fontWeight: '600',
-              border: '1px solid rgba(0, 255, 100, 0.1)',
-              textAlign: 'center'
-            }}>
-              ✓ {message}
+          {scrapedData.length > 0 && (
+            <div style={{ marginTop: '32px' }}>
+              <div style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: '16px'
+              }}>
+                <h2 style={{
+                  fontSize: '18px',
+                  fontWeight: '700',
+                  color: '#ffffff',
+                  margin: 0
+                }}>
+                  Scraped Videos ({scrapedData.length})
+                </h2>
+                <span style={{
+                  fontSize: '13px',
+                  color: '#00ff64',
+                  fontWeight: '600'
+                }}>
+                  ✓ {message}
+                </span>
+              </div>
+              <div style={{
+                overflowX: 'auto',
+                borderRadius: '16px',
+                border: '1px solid rgba(255,255,255,0.06)'
+              }}>
+                <table style={{
+                  width: '100%',
+                  borderCollapse: 'collapse',
+                  fontSize: '13px'
+                }}>
+                  <thead>
+                    <tr style={{
+                      backgroundColor: 'rgba(255,255,255,0.03)',
+                      borderBottom: '1px solid rgba(255,255,255,0.06)'
+                    }}>
+                      <th style={thStyle}>#</th>
+                      <th style={thStyle}>Name</th>
+                      <th style={thStyle}>URL</th>
+                      <th style={thStyle}>Status</th>
+                      <th style={thStyle}>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {scrapedData.map((item, i) => (
+                      <tr key={i} style={{
+                        borderBottom: '1px solid rgba(255,255,255,0.04)',
+                        transition: 'background 0.2s'
+                      }}>
+                        <td style={tdStyle}>{i + 1}</td>
+                        <td style={{ ...tdStyle, maxWidth: '250px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.name}>
+                          {item.name}
+                        </td>
+                        <td style={{ ...tdStyle, maxWidth: '350px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.url}>
+                          {item.url}
+                        </td>
+                        <td style={tdStyle}>
+                          <span style={{
+                            display: 'inline-block',
+                            padding: '4px 12px',
+                            borderRadius: '20px',
+                            fontSize: '12px',
+                            fontWeight: '600',
+                            backgroundColor: item.status ? 'rgba(0, 255, 100, 0.1)' : 'rgba(255, 180, 0, 0.1)',
+                            color: item.status ? '#00ff64' : '#ffb400'
+                          }}>
+                            {item.status ? 'Downloaded' : 'Fetched'}
+                          </span>
+                        </td>
+                        <td style={tdStyle}>
+                          <button
+                            onClick={() => handleConvert(item.url, i)}
+                            disabled={convertingIdx === i || item.status}
+                            style={{
+                              padding: '6px 16px',
+                              fontSize: '12px',
+                              fontWeight: '700',
+                              background: convertingIdx === i ? 'rgba(255, 180, 0, 0.15)' : item.status ? 'rgba(0, 255, 100, 0.1)' : 'rgba(255, 255, 255, 0.08)',
+                              color: convertingIdx === i ? '#ffb400' : item.status ? '#00ff64' : '#ffffff',
+                              border: convertingIdx === i ? '1px solid rgba(255, 180, 0, 0.3)' : item.status ? '1px solid rgba(0, 255, 100, 0.2)' : '1px solid rgba(255, 255, 255, 0.15)',
+                              borderRadius: '12px',
+                              cursor: convertingIdx === i || item.status ? 'not-allowed' : 'pointer',
+                              transition: 'all 0.3s ease',
+                              whiteSpace: 'nowrap'
+                            }}
+                          >
+                            {convertingIdx === i ? 'Converting...' : item.status ? 'Done' : 'Download MP3'}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
 

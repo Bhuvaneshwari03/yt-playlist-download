@@ -53,7 +53,7 @@ async function scrape() {
     // Wait for the page to stabilize
     await new Promise(resolve => setTimeout(resolve, 3000));
 
-    let videoLinks: { url: string; status: boolean }[] = [];
+    let videoLinks: { name: string; url: string; status: boolean }[] = [];
 
     if (type === 'playlist') {
       console.log('Scraping playlist mode...');
@@ -65,38 +65,57 @@ async function scrape() {
         console.log('Warning: Standard playlist selectors not found, attempting general extraction.');
       }
 
-      // Extract all video links found in the playlist area
-      const links = await page.evaluate(() => {
-        // Look for links that contain "watch?v=" and are inside the playlist container
+      // Extract all video links and names found in the playlist area
+      const items = await page.evaluate(() => {
         const anchors = document.querySelectorAll('ytd-playlist-video-renderer a#video-title, ytd-playlist-panel-video-renderer a.ytd-playlist-panel-video-renderer, a#video-title');
-        const urls = Array.from(anchors).map(a => (a as HTMLAnchorElement).href);
-        return [...new Set(urls)].filter(link => link && link.includes('watch?v='));
+        const seen = new Set<string>();
+        return Array.from(anchors).reduce((acc: { url: string; name: string }[], a) => {
+          const href = (a as HTMLAnchorElement).href;
+          const name = (a as HTMLElement).title || (a as HTMLElement).innerText.trim();
+          if (href && href.includes('watch?v=') && !seen.has(href)) {
+            seen.add(href);
+            acc.push({ url: href, name });
+          }
+          return acc;
+        }, []);
       });
 
-      videoLinks = links.map(link => ({
-        // Clean URL to remove playlist noise for individual links
-        url: link.split('&list=')[0].split('&pp=')[0].split('&index=')[0], 
-        status: true
+      videoLinks = items.map(item => ({
+        name: item.name || 'Unknown',
+        url: item.url.split('&list=')[0].split('&pp=')[0].split('&index=')[0],
+        status: false
       }));
 
       if (videoLinks.length === 0) {
         console.log('No playlist items found with specific selectors. Trying fallback...');
-        const fallbackLinks = await page.evaluate(() => {
-          const allLinks = Array.from(document.querySelectorAll('a')).map(a => a.href);
-          return [...new Set(allLinks)].filter(l => l.includes('watch?v=') && (l.includes('list=') || l.includes('index=')));
+        const fallbackItems = await page.evaluate(() => {
+          const allLinks = Array.from(document.querySelectorAll('a'));
+          const seen = new Set<string>();
+          return allLinks.reduce((acc: { url: string; name: string }[], a) => {
+            const href = a.href;
+            const name = a.title || a.innerText.trim();
+            if (href.includes('watch?v=') && (href.includes('list=') || href.includes('index=')) && !seen.has(href)) {
+              seen.add(href);
+              acc.push({ url: href, name });
+            }
+            return acc;
+          }, []);
         });
-        videoLinks = fallbackLinks.map(link => ({
-          url: link.split('&list=')[0].split('&pp=')[0].split('&index=')[0],
-          status: true
+        videoLinks = fallbackItems.map(item => ({
+          name: item.name || 'Unknown',
+          url: item.url.split('&list=')[0].split('&pp=')[0].split('&index=')[0],
+          status: false
         }));
       }
     } else {
       console.log('Scraping single video mode...');
-      // In single video mode, we only want the primary URL, cleaned of playlist parameters
       const cleanUrl = url.split('&list=')[0].split('&pp=')[0].split('&index=')[0];
+      const pageTitle = await page.title();
+      const videoName = pageTitle.replace(' - YouTube', '');
       videoLinks = [{
+        name: videoName || 'Unknown',
         url: cleanUrl,
-        status: true
+        status: false
       }];
     }
 
@@ -112,7 +131,7 @@ async function scrape() {
     await fs.writeJson(filePath, videoLinks, { spaces: 2 });
 
     console.log(`Successfully scraped ${videoLinks.length} videos in ${type} mode.`);
-    console.log(`Data saved to: ${filePath}`);
+    console.log(`__FILE__:${fileName}`);
 
   } catch (error: any) {
     console.error('Scraping failed:', error.message || error);
