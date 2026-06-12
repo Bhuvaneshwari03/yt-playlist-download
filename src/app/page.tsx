@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useRef } from 'react';
 
 interface VideoItem {
   name: string;
@@ -12,11 +12,13 @@ export default function Home() {
   const [url, setUrl] = useState('');
   const [type, setType] = useState<'playlist' | 'video'>('playlist');
   const [loading, setLoading] = useState(false);
-  const [convertingIdx, setConvertingIdx] = useState<number | null>(null);
-  const [message, setMessage] = useState('');
+  const [scrapeProgress, setScrapeProgress] = useState('');
+  const [downloadingAll, setDownloadingAll] = useState(false);
+  const [downloadAllProgress, setDownloadAllProgress] = useState('');
   const [error, setError] = useState('');
   const [scrapedFile, setScrapedFile] = useState<string | null>(null);
   const [scrapedData, setScrapedData] = useState<VideoItem[]>([]);
+  const scrapedFileRef = useRef<string | null>(null);
 
   const validateUrl = (input: string) => {
     if (!input) {
@@ -45,33 +47,63 @@ export default function Home() {
     if (!validateUrl(url)) return;
 
     setLoading(true);
-    setMessage('');
+    setScrapeProgress('Opening browser...');
+    setScrapedData([]);
+    setScrapedFile(null);
+    scrapedFileRef.current = null;
     setError('');
 
     try {
       const response = await fetch('/api/scrape', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, type }),
       });
 
-      const data = await response.json();
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: 'Scraping failed' }));
+        setError(err.error || 'Scraping failed');
+        setLoading(false);
+        return;
+      }
 
-      if (response.ok) {
-        setMessage(data.message);
-        setScrapedFile(data.filename);
-        setScrapedData(data.data || []);
-      } else {
-        // Handle specific error details from the scraper
-        const errorDetail = data.details || data.error;
-        if (errorDetail?.includes('Navigation timeout')) {
-          setError('Request timed out. Please check your connection.');
-        } else if (errorDetail?.includes('No video links found')) {
-          setError(`No ${type} found at this link. Please check your selection.`);
-        } else {
-          setError(data.error || 'Scraping failed. Please verify the URL.');
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('ndjson')) {
+        setError('Unexpected response format');
+        setLoading(false);
+        return;
+      }
+
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line) continue;
+
+          if (line.startsWith('__DONE__:')) {
+            const filename = line.slice('__DONE__:'.length).trim();
+            setScrapedFile(filename);
+            scrapedFileRef.current = filename;
+            setScrapeProgress('Scraping complete!');
+          } else if (line.startsWith('__ERROR__:')) {
+            const msg = line.slice('__ERROR__:'.length);
+            setError(msg);
+          } else {
+            try {
+              const video = JSON.parse(line);
+              setScrapedData(prev => [...prev, { name: video.name, url: video.url, status: false }]);
+              setScrapeProgress(`Found ${video.name ? video.name.slice(0, 40) : 'video'}...`);
+            } catch {}
+          }
         }
       }
     } catch (err) {
@@ -79,55 +111,72 @@ export default function Home() {
       console.error(err);
     } finally {
       setLoading(false);
+      setScrapeProgress('');
     }
   };
 
-  const handleConvert = useCallback(async (videoUrl: string, index: number) => {
-    setConvertingIdx(index);
-
-    try {
-      const response = await fetch('/api/convert', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          videoUrl,
-          jsonFilename: scrapedFile,
-          videoIndex: index,
-        }),
-      });
-
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error || 'Conversion failed');
-      }
-
-      const blob = await response.blob();
-      const contentDisposition = response.headers.get('Content-Disposition');
-      const match = contentDisposition?.match(/filename="?(.+?)"?$/);
-      const fileName = match ? match[1] : `video_${index + 1}.mp3`;
-
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = fileName;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-
-      setScrapedData(prev => {
-        const next = [...prev];
-        if (next[index]) {
-          next[index] = { ...next[index], status: true };
-        }
-        return next;
-      });
-    } catch (err: any) {
-      setError(err.message || 'Download failed');
-    } finally {
-      setConvertingIdx(null);
+  const handleDownloadAll = async () => {
+    const file = scrapedFileRef.current;
+    if (!file) {
+      setError('No scraped data to download');
+      return;
     }
-  }, [scrapedFile]);
+
+    setDownloadingAll(true);
+    setDownloadAllProgress('Starting...');
+    setError('');
+
+    for (let i = 0; i < scrapedData.length; i++) {
+      if (scrapedData[i].status) continue;
+
+      setDownloadAllProgress(`Downloading ${i + 1}/${scrapedData.length}...`);
+
+      try {
+        const response = await fetch('/api/convert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            videoUrl: scrapedData[i].url,
+            jsonFilename: file,
+            videoIndex: i,
+          }),
+        });
+
+        if (!response.ok) {
+          const err = await response.json();
+          throw new Error(err.error || `Video ${i + 1} failed`);
+        }
+
+        const blob = await response.blob();
+        const contentDisposition = response.headers.get('Content-Disposition');
+        const cdMatch = contentDisposition?.match(/filename="?(.+?)"?$/);
+        const fileName = cdMatch ? cdMatch[1] : `video_${i + 1}.mp3`;
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        setScrapedData(prev => {
+          const next = [...prev];
+          if (next[i]) {
+            next[i] = { ...next[i], status: true };
+          }
+          return next;
+        });
+      } catch (err: any) {
+        setError(err.message || `Video ${i + 1} failed`);
+        break;
+      }
+    }
+
+    setDownloadingAll(false);
+    setDownloadAllProgress('');
+  };
 
   const thStyle: React.CSSProperties = {
     padding: '12px 16px',
@@ -332,9 +381,32 @@ export default function Home() {
                 letterSpacing: '1px'
               }}
             >
-              {loading ? 'Processing...' : 'Engage Scraper'}
+              {loading ? (scrapeProgress || 'Processing...') : 'Engage Scraper'}
             </button>
 
+            {scrapedData.length > 0 && (
+              <button
+                onClick={handleDownloadAll}
+                disabled={downloadingAll}
+                style={{
+                  width: '100%',
+                  padding: '18px',
+                  fontSize: '15px',
+                  fontWeight: '800',
+                  background: downloadingAll ? '#1a1a1a' : 'linear-gradient(to right, #00cc44, #009933)',
+                  color: downloadingAll ? '#444' : 'white',
+                  border: 'none',
+                  borderRadius: '24px',
+                  cursor: downloadingAll ? 'not-allowed' : 'pointer',
+                  transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                  boxShadow: downloadingAll ? 'none' : '0 15px 30px rgba(0, 204, 68, 0.25)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '1px'
+                }}
+              >
+                {downloadingAll ? downloadAllProgress : `Download All (${scrapedData.length})`}
+              </button>
+            )}
 
           </div>
 
@@ -359,7 +431,7 @@ export default function Home() {
                   color: '#00ff64',
                   fontWeight: '600'
                 }}>
-                  ✓ {message}
+                  ✓ {scrapedFile ? 'Scraped' : `${scrapedData.length} found`}
                 </span>
               </div>
               <div style={{
@@ -381,7 +453,6 @@ export default function Home() {
                       <th style={thStyle}>Name</th>
                       <th style={thStyle}>URL</th>
                       <th style={thStyle}>Status</th>
-                      <th style={thStyle}>Action</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -409,26 +480,6 @@ export default function Home() {
                           }}>
                             {item.status ? 'Downloaded' : 'Fetched'}
                           </span>
-                        </td>
-                        <td style={tdStyle}>
-                          <button
-                            onClick={() => handleConvert(item.url, i)}
-                            disabled={convertingIdx === i || item.status}
-                            style={{
-                              padding: '6px 16px',
-                              fontSize: '12px',
-                              fontWeight: '700',
-                              background: convertingIdx === i ? 'rgba(255, 180, 0, 0.15)' : item.status ? 'rgba(0, 255, 100, 0.1)' : 'rgba(255, 255, 255, 0.08)',
-                              color: convertingIdx === i ? '#ffb400' : item.status ? '#00ff64' : '#ffffff',
-                              border: convertingIdx === i ? '1px solid rgba(255, 180, 0, 0.3)' : item.status ? '1px solid rgba(0, 255, 100, 0.2)' : '1px solid rgba(255, 255, 255, 0.15)',
-                              borderRadius: '12px',
-                              cursor: convertingIdx === i || item.status ? 'not-allowed' : 'pointer',
-                              transition: 'all 0.3s ease',
-                              whiteSpace: 'nowrap'
-                            }}
-                          >
-                            {convertingIdx === i ? 'Converting...' : item.status ? 'Done' : 'Download MP3'}
-                          </button>
                         </td>
                       </tr>
                     ))}
