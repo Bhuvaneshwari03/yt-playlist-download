@@ -1,11 +1,34 @@
 'use client';
 
-import { useState, useRef } from 'react';
+import { useRef, useState } from 'react';
+
+type DownloadStatus = 'fetched' | 'queued' | 'converting' | 'downloaded' | 'failed' | 'skipped';
 
 interface VideoItem {
   name: string;
   url: string;
   status: boolean;
+  downloadStatus?: DownloadStatus;
+  filePath?: string;
+  error?: string;
+}
+
+type ConvertEvent =
+  | { type: 'start'; total: number; downloadDir: string }
+  | { type: 'progress'; index: number; name?: string }
+  | { type: 'saved'; index: number; fileName: string; filePath: string }
+  | { type: 'skip'; index: number }
+  | { type: 'error'; index: number; error?: string }
+  | { type: 'fatal'; error?: string }
+  | { type: 'done'; downloadDir: string };
+
+function getErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function readStoredDownloadDir() {
+  if (typeof window === 'undefined') return 'temp_downloads';
+  return window.localStorage.getItem('downloadDir') || 'temp_downloads';
 }
 
 export default function Home() {
@@ -18,7 +41,14 @@ export default function Home() {
   const [error, setError] = useState('');
   const [scrapedFile, setScrapedFile] = useState<string | null>(null);
   const [scrapedData, setScrapedData] = useState<VideoItem[]>([]);
+  const [downloadDir, setDownloadDir] = useState(readStoredDownloadDir);
   const scrapedFileRef = useRef<string | null>(null);
+
+  const handleDownloadDirChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value;
+    setDownloadDir(value);
+    window.localStorage.setItem('downloadDir', value);
+  };
 
   const validateUrl = (input: string) => {
     if (!input) {
@@ -48,10 +78,12 @@ export default function Home() {
 
     setLoading(true);
     setScrapeProgress('Opening browser...');
+    setDownloadAllProgress('');
     setScrapedData([]);
     setScrapedFile(null);
     scrapedFileRef.current = null;
     setError('');
+    const foundVideos: VideoItem[] = [];
 
     try {
       const response = await fetch('/api/scrape', {
@@ -93,15 +125,21 @@ export default function Home() {
             const filename = line.slice('__DONE__:'.length).trim();
             setScrapedFile(filename);
             scrapedFileRef.current = filename;
-            setScrapeProgress('Scraping complete!');
+            setScrapeProgress(`Scraping complete. Starting downloads for ${foundVideos.length} item(s)...`);
+            if (foundVideos.length > 0) {
+              await downloadAll(foundVideos, filename);
+            }
           } else if (line.startsWith('__ERROR__:')) {
             const msg = line.slice('__ERROR__:'.length);
             setError(msg);
           } else {
             try {
-              const video = JSON.parse(line);
-              setScrapedData(prev => [...prev, { name: video.name, url: video.url, status: false }]);
-              setScrapeProgress(`Found ${video.name ? video.name.slice(0, 40) : 'video'}...`);
+              const video = JSON.parse(line) as { name?: string; url?: string };
+              if (!video.url) continue;
+              const item = { name: video.name || 'Unknown', url: video.url, status: false, downloadStatus: 'fetched' as DownloadStatus };
+              foundVideos.push(item);
+              setScrapedData(prev => [...prev, item]);
+              setScrapeProgress(`Found ${foundVideos.length}: ${video.name ? video.name.slice(0, 40) : 'video'}...`);
             } catch {}
           }
         }
@@ -111,71 +149,95 @@ export default function Home() {
       console.error(err);
     } finally {
       setLoading(false);
-      setScrapeProgress('');
+      if (!downloadingAll) setScrapeProgress('');
     }
   };
 
-  const handleDownloadAll = async () => {
-    const file = scrapedFileRef.current;
+  const downloadAll = async (items: VideoItem[], file: string | null) => {
     if (!file) {
       setError('No scraped data to download');
       return;
     }
 
     setDownloadingAll(true);
-    setDownloadAllProgress('Starting...');
+    setDownloadAllProgress('Starting converter...');
     setError('');
 
-    for (let i = 0; i < scrapedData.length; i++) {
-      if (scrapedData[i].status) continue;
+    setScrapedData(prev => prev.map(item => (
+      item.status ? item : { ...item, downloadStatus: 'queued' }
+    )));
 
-      setDownloadAllProgress(`Downloading ${i + 1}/${scrapedData.length}...`);
+    try {
+      const response = await fetch('/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          videos: items,
+          jsonFilename: file,
+          downloadDir,
+        }),
+      });
 
-      try {
-        const response = await fetch('/api/convert', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            videoUrl: scrapedData[i].url,
-            jsonFilename: file,
-            videoIndex: i,
-          }),
-        });
-
-        if (!response.ok) {
-          const err = await response.json();
-          throw new Error(err.error || `Video ${i + 1} failed`);
-        }
-
-        const blob = await response.blob();
-        const contentDisposition = response.headers.get('Content-Disposition');
-        const cdMatch = contentDisposition?.match(/filename="?(.+?)"?$/);
-        const fileName = cdMatch ? cdMatch[1] : `video_${i + 1}.mp3`;
-
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = fileName;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-
-        setScrapedData(prev => {
-          const next = [...prev];
-          if (next[i]) {
-            next[i] = { ...next[i], status: true };
-          }
-          return next;
-        });
-      } catch (err: any) {
-        setError(err.message || `Video ${i + 1} failed`);
-        break;
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: 'Conversion failed' }));
+        throw new Error(err.error || 'Conversion failed');
       }
-    }
 
-    setDownloadingAll(false);
-    setDownloadAllProgress('');
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line) continue;
+          const event = JSON.parse(line) as ConvertEvent;
+
+          if (event.type === 'start') {
+            setDownloadAllProgress(`Saving ${event.total} item(s) to ${event.downloadDir}`);
+          } else if (event.type === 'progress') {
+            setDownloadAllProgress(`Converting ${event.index + 1}/${items.length}: ${event.name?.slice(0, 36) || 'video'}`);
+            setScrapedData(prev => prev.map((item, index) => (
+              index === event.index ? { ...item, downloadStatus: 'converting' } : item
+            )));
+          } else if (event.type === 'saved') {
+            setDownloadAllProgress(`Saved ${event.index + 1}/${items.length}: ${event.fileName}`);
+            setScrapedData(prev => prev.map((item, index) => (
+              index === event.index
+                ? { ...item, status: true, downloadStatus: 'downloaded', filePath: event.filePath, error: undefined }
+                : item
+            )));
+          } else if (event.type === 'skip') {
+            setScrapedData(prev => prev.map((item, index) => (
+              index === event.index ? { ...item, downloadStatus: 'skipped' } : item
+            )));
+          } else if (event.type === 'error') {
+            setError(event.error || `Video ${event.index + 1} failed`);
+            setScrapedData(prev => prev.map((item, index) => (
+              index === event.index ? { ...item, downloadStatus: 'failed', error: event.error } : item
+            )));
+          } else if (event.type === 'fatal') {
+            throw new Error(event.error || 'Conversion failed');
+          } else if (event.type === 'done') {
+            setDownloadAllProgress(`Done. Files saved to ${event.downloadDir}`);
+          }
+        }
+      }
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Download failed'));
+    } finally {
+      setDownloadingAll(false);
+    }
+  };
+
+  const handleDownloadAll = async () => {
+    await downloadAll(scrapedData, scrapedFileRef.current);
   };
 
   const thStyle: React.CSSProperties = {
@@ -318,6 +380,47 @@ export default function Home() {
               />
             </div>
 
+            <div>
+              <input
+                id="downloadDir"
+                type="text"
+                value={downloadDir}
+                onChange={handleDownloadDirChange}
+                placeholder="Download folder path"
+                style={{
+                  width: '100%',
+                  padding: '16px 20px',
+                  fontSize: '14px',
+                  fontWeight: '500',
+                  borderRadius: '18px',
+                  border: '1px solid rgba(255,255,255,0.1)',
+                  outline: 'none',
+                  backgroundColor: 'rgba(255,255,255,0.03)',
+                  color: '#ffffff',
+                  boxSizing: 'border-box',
+                  transition: 'all 0.3s ease',
+                  textAlign: 'center'
+                }}
+                onFocus={(e) => {
+                  e.currentTarget.style.border = '1px solid rgba(255, 0, 51, 0.5)';
+                  e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.05)';
+                }}
+                onBlur={(e) => {
+                  e.currentTarget.style.border = '1px solid rgba(255,255,255,0.1)';
+                  e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.03)';
+                }}
+              />
+              <div style={{
+                marginTop: '8px',
+                color: '#666',
+                fontSize: '12px',
+                textAlign: 'center',
+                fontWeight: 600
+              }}>
+                Files are saved directly by the server. Relative paths stay inside this project.
+              </div>
+            </div>
+
             <div style={{ 
               backgroundColor: 'rgba(255,255,255,0.02)', 
               padding: '8px', 
@@ -364,19 +467,19 @@ export default function Home() {
 
             <button
               onClick={handleFetch}
-              disabled={loading || !url}
+              disabled={loading || downloadingAll || !url}
               style={{
                 width: '100%',
                 padding: '22px',
                 fontSize: '16px',
                 fontWeight: '800',
-                background: loading || !url ? '#1a1a1a' : 'linear-gradient(to right, #ff0033, #cc0022)',
-                color: loading || !url ? '#444' : 'white',
+                background: loading || downloadingAll || !url ? '#1a1a1a' : 'linear-gradient(to right, #ff0033, #cc0022)',
+                color: loading || downloadingAll || !url ? '#444' : 'white',
                 border: 'none',
                 borderRadius: '24px',
-                cursor: loading || !url ? 'not-allowed' : 'pointer',
+                cursor: loading || downloadingAll || !url ? 'not-allowed' : 'pointer',
                 transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
-                boxShadow: loading || !url ? 'none' : '0 15px 30px rgba(255, 0, 51, 0.25)',
+                boxShadow: loading || downloadingAll || !url ? 'none' : '0 15px 30px rgba(255, 0, 51, 0.25)',
                 textTransform: 'uppercase',
                 letterSpacing: '1px'
               }}
@@ -387,25 +490,36 @@ export default function Home() {
             {scrapedData.length > 0 && (
               <button
                 onClick={handleDownloadAll}
-                disabled={downloadingAll}
+                disabled={downloadingAll || loading || !scrapedFile}
                 style={{
                   width: '100%',
                   padding: '18px',
                   fontSize: '15px',
                   fontWeight: '800',
-                  background: downloadingAll ? '#1a1a1a' : 'linear-gradient(to right, #00cc44, #009933)',
-                  color: downloadingAll ? '#444' : 'white',
+                  background: downloadingAll || loading || !scrapedFile ? '#1a1a1a' : 'linear-gradient(to right, #00cc44, #009933)',
+                  color: downloadingAll || loading || !scrapedFile ? '#444' : 'white',
                   border: 'none',
                   borderRadius: '24px',
-                  cursor: downloadingAll ? 'not-allowed' : 'pointer',
+                  cursor: downloadingAll || loading || !scrapedFile ? 'not-allowed' : 'pointer',
                   transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
-                  boxShadow: downloadingAll ? 'none' : '0 15px 30px rgba(0, 204, 68, 0.25)',
+                  boxShadow: downloadingAll || loading || !scrapedFile ? 'none' : '0 15px 30px rgba(0, 204, 68, 0.25)',
                   textTransform: 'uppercase',
                   letterSpacing: '1px'
                 }}
               >
                 {downloadingAll ? downloadAllProgress : `Download All (${scrapedData.length})`}
               </button>
+            )}
+
+            {downloadAllProgress && !downloadingAll && (
+              <div style={{
+                color: '#00ff64',
+                fontSize: '13px',
+                fontWeight: 700,
+                textAlign: 'center'
+              }}>
+                {downloadAllProgress}
+              </div>
             )}
 
           </div>
@@ -475,11 +589,33 @@ export default function Home() {
                             borderRadius: '20px',
                             fontSize: '12px',
                             fontWeight: '600',
-                            backgroundColor: item.status ? 'rgba(0, 255, 100, 0.1)' : 'rgba(255, 180, 0, 0.1)',
-                            color: item.status ? '#00ff64' : '#ffb400'
+                            backgroundColor: item.downloadStatus === 'failed'
+                              ? 'rgba(255, 0, 51, 0.1)'
+                              : item.status
+                                ? 'rgba(0, 255, 100, 0.1)'
+                                : item.downloadStatus === 'converting'
+                                  ? 'rgba(0, 140, 255, 0.12)'
+                                  : 'rgba(255, 180, 0, 0.1)',
+                            color: item.downloadStatus === 'failed'
+                              ? '#ff0033'
+                              : item.status
+                                ? '#00ff64'
+                                : item.downloadStatus === 'converting'
+                                  ? '#55aaff'
+                                  : '#ffb400'
                           }}>
-                            {item.status ? 'Downloaded' : 'Fetched'}
+                            {item.status ? 'Downloaded' : (item.downloadStatus || 'Fetched')}
                           </span>
+                          {item.filePath && (
+                            <div style={{ marginTop: '6px', color: '#666', fontSize: '11px', maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.filePath}>
+                              {item.filePath}
+                            </div>
+                          )}
+                          {item.error && (
+                            <div style={{ marginTop: '6px', color: '#ff6680', fontSize: '11px', maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.error}>
+                              {item.error}
+                            </div>
+                          )}
                         </td>
                       </tr>
                     ))}

@@ -1,4 +1,4 @@
-import puppeteer from 'puppeteer';
+import { chromium } from 'playwright';
 import fs from 'fs-extra';
 import path from 'path';
 
@@ -39,20 +39,20 @@ async function scrape() {
   }
 
   console.log('Launching browser...');
-  const browser = await puppeteer.launch({
+  const browser = await chromium.launch({
     executablePath,
     headless: false,
-    defaultViewport: null,
     args: ['--start-maximized'],
   });
 
-  const [page] = await browser.pages();
+  const context = await browser.newContext({
+    viewport: null,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  });
+  const page = await context.newPage();
 
   try {
     console.log(`Navigating to: ${url}`);
-
-    // Set a realistic user agent
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
     await page.goto(url, { waitUntil: 'load', timeout: 60000 }).catch(e => console.log('Navigation warning:', e.message));
 
@@ -67,7 +67,7 @@ async function scrape() {
       // Wait for playlist items
       try {
         await page.waitForSelector('ytd-playlist-video-renderer, ytd-playlist-panel-video-renderer, yt-lockup-view-model', { timeout: 15000 });
-      } catch (e) {
+      } catch {
         console.log('Warning: Standard playlist selectors not found, attempting general extraction.');
       }
 
@@ -125,7 +125,7 @@ async function scrape() {
         
         // Wait for network to settle after potential continuation click
         await new Promise(r => setTimeout(r, 3000));
-        await page.waitForNetworkIdle({ timeout: 5000 }).catch(() => {});
+        await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
       }
 
       // Extract playlist items only from the playlist container
@@ -311,7 +311,7 @@ async function scrape() {
       // Wait for title element or player metadata to load to ensure frame stability
       try {
         await page.waitForSelector('h1.ytd-watch-metadata, yt-formatted-string.ytd-video-primary-info-renderer', { timeout: 15000 });
-      } catch (e) {
+      } catch {
         console.log('Warning: Video title element not found, attempting direct title extraction.');
       }
 
@@ -355,8 +355,8 @@ async function scrape() {
     console.log(`Successfully scraped ${videoLinks.length} videos in ${type} mode.`);
     console.log(`__FILE__:${fileName}`);
 
-  } catch (error: any) {
-    console.error('Scraping failed:', error.message || error);
+  } catch (error: unknown) {
+    console.error('Scraping failed:', error instanceof Error ? error.message : error);
     process.exit(1);
   } finally {
     console.log('Closing browser in 3 seconds...');

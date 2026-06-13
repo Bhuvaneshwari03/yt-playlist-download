@@ -12,7 +12,7 @@
   "dependencies": {
     "fs-extra": "^11.3.5",
     "next": "16.2.7",
-    "puppeteer": "^24.43.1",
+    "playwright": "^1.60.0",
     "react": "19.2.4",
     "react-dom": "19.2.4"
   },

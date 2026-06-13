@@ -3,6 +3,8 @@ import { spawn } from 'child_process';
 import readline from 'readline';
 import path from 'path';
 
+export const runtime = 'nodejs';
+
 export async function POST(req: NextRequest) {
   try {
     const { url, type } = await req.json();
@@ -18,7 +20,7 @@ export async function POST(req: NextRequest) {
 
     const stream = new ReadableStream({
       async start(controller) {
-        const child = spawn('npx', ['tsx', `"${scraperPath}"`, `"${url}"`, `"${type}"`], {
+        const child = spawn('npx', ['tsx', scraperPath, url, type], {
           shell: true,
           env: { ...process.env, PUPPETEER_SKIP_DOWNLOAD: 'true' },
         });
@@ -61,9 +63,9 @@ export async function POST(req: NextRequest) {
     return new Response(stream, {
       headers: { 'Content-Type': 'application/x-ndjson' },
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('API Error:', error);
-    return new Response(JSON.stringify({ error: error.message || 'Internal Server Error' }), {
+    return new Response(JSON.stringify({ error: error instanceof Error ? error.message : 'Internal Server Error' }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' },
     });
