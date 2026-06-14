@@ -92,18 +92,16 @@ async function scrape() {
             }
           }
 
-          const continuationItem = document.querySelector('ytd-continuation-item-renderer');
+          const continuationItem = document.querySelector('ytd-continuation-item-renderer') as HTMLElement;
           if (continuationItem) {
             continuationItem.scrollIntoView({ block: 'center', behavior: 'smooth' });
-            // Wait a moment for it to be actionable
-            setTimeout(() => {
-              const btn = continuationItem.querySelector('button, a') as HTMLElement;
-              if (btn) btn.click();
-              else (continuationItem as HTMLElement).click();
-            }, 500);
+            const btn = continuationItem.querySelector('button, a') as HTMLElement;
+            if (btn) btn.click();
+            else continuationItem.click();
           }
 
-          const items = document.querySelectorAll('ytd-playlist-video-renderer, ytd-playlist-panel-video-renderer, yt-lockup-view-model');
+          // Use broader selectors for count to avoid 15s delay if elements use newer classes
+          const items = document.querySelectorAll('ytd-playlist-video-renderer, ytd-playlist-panel-video-renderer, yt-lockup-view-model, ytd-grid-video-renderer');
           return items.length;
         });
 
@@ -126,7 +124,7 @@ async function scrape() {
       }
 
       // Extract playlist items
-      const items = await page.evaluate(() => {
+      const items = await page.evaluate((targetListId) => {
         const result = [];
         const seenUrls = new Set();
         
@@ -134,10 +132,11 @@ async function scrape() {
         const containers = [
           'ytd-playlist-video-list-renderer', // Dedicated playlist page
           'ytd-playlist-panel-renderer',      // Watch page playlist panel
-          'ytd-section-list-renderer'         // Fallback
+          '#playlist-items',                  // Specific items container
+          'ytd-section-list-renderer #contents' // More specific fallback
         ];
         
-        let root = document as unknown as ParentNode;
+        let root: ParentNode = document;
         for (const selector of containers) {
           const found = document.querySelector(selector);
           if (found && (found as HTMLElement).offsetParent !== null) {
@@ -153,21 +152,27 @@ async function scrape() {
           'ytd-grid-video-renderer'
         ];
         
-        const listItems = root.querySelectorAll(itemSelectors.join(', '));
+        let listItems = Array.from(root.querySelectorAll(itemSelectors.join(', ')));
+        
+        // Fallback: if we found nothing in the detected root, try the whole document
+        if (listItems.length === 0 && root !== document) {
+            listItems = Array.from(document.querySelectorAll(itemSelectors.join(', ')));
+        }
 
         for (const item of listItems) {
-          // If we found a container but this item is outside of it (e.g. related videos), skip it
-          // This is a safety check if root is still document
-          if (root === document) {
-            const isRelated = item.closest('#related, #items, ytd-watch-next-secondary-results-renderer');
-            if (isRelated) continue;
+          // Robust check to skip related/suggested videos
+          const isRelated = item.closest('#related, #secondary, ytd-watch-next-secondary-results-renderer, ytd-compact-video-renderer, #items.ytd-watch-next-secondary-results-renderer');
+          
+          if (isRelated) {
+            // Only include if it's explicitly inside the playlist panel
+            if (!item.closest('ytd-playlist-panel-renderer')) continue;
           }
 
-          // Skip if it's a private or deleted video - more robust check
+          // Skip if it's a private or deleted video
           const textContent = item.textContent || '';
           if (textContent.includes('[Private video]') || textContent.includes('[Deleted video]')) continue;
 
-          // Find the video link - be more generic
+          // Find the video link
           const allLinks = Array.from(item.querySelectorAll('a'));
           const videoLinkEl = allLinks.find(a => {
             const href = a.href || '';
@@ -180,6 +185,16 @@ async function scrape() {
             const u = new URL(videoLinkEl.href);
             const v = u.searchParams.get('v');
             if (!v) continue;
+
+            const listId = u.searchParams.get('list');
+            
+            // If we have a target playlist ID, and the video has a different list ID, it's likely a suggestion/mix
+            if (targetListId && listId && listId !== targetListId) {
+                // Special case for Mixes which often start with RD
+                if (!targetListId.startsWith('RD') && listId.startsWith('RD')) continue;
+                // General mismatch
+                if (targetListId !== listId) continue;
+            }
 
             const cleanUrl = `https://www.youtube.com/watch?v=${v}`;
             if (seenUrls.has(cleanUrl)) continue;
@@ -199,19 +214,17 @@ async function scrape() {
             for (const selector of titleSelectors) {
                 const el = item.querySelector(selector);
                 const text = el?.textContent?.trim();
-                // Basic check to skip duration-only strings (e.g., "9:34")
-                if (text && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(text) && text.length > 5) {
+                if (text && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(text) && text.length > 2) {
                     name = text;
                     break;
                 }
             }
             
             if (!name) {
-                // If still no name, try any link text that isn't a duration
                 const links = Array.from(item.querySelectorAll('a'));
                 for (const a of links) {
                     const text = a.textContent?.trim();
-                    if (text && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(text) && text.length > 5) {
+                    if (text && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(text) && text.length > 2) {
                         name = text;
                         break;
                     }
@@ -222,7 +235,7 @@ async function scrape() {
           } catch { }
         }
         return result;
-      });
+      }, targetListId);
 
       videoLinks = items.map(item => ({
         name: item.name,
