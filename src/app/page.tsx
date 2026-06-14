@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 type DownloadStatus = 'fetched' | 'queued' | 'converting' | 'downloaded' | 'failed' | 'skipped';
 
@@ -26,11 +26,6 @@ function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
 
-function readStoredDownloadDir() {
-  if (typeof window === 'undefined') return 'temp_downloads';
-  return window.localStorage.getItem('downloadDir') || 'temp_downloads';
-}
-
 export default function Home() {
   const [url, setUrl] = useState('');
   const [type, setType] = useState<'playlist' | 'video'>('playlist');
@@ -41,13 +36,37 @@ export default function Home() {
   const [error, setError] = useState('');
   const [scrapedFile, setScrapedFile] = useState<string | null>(null);
   const [scrapedData, setScrapedData] = useState<VideoItem[]>([]);
-  const [downloadDir, setDownloadDir] = useState(readStoredDownloadDir);
+  const [downloadDir, setDownloadDir] = useState('');
+  const [browsing, setBrowsing] = useState(false);
+  const [showManualPath, setShowManualPath] = useState(false);
   const scrapedFileRef = useRef<string | null>(null);
 
-  const handleDownloadDirChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value;
-    setDownloadDir(value);
-    window.localStorage.setItem('downloadDir', value);
+  // Fix hydration by loading from localStorage after mount
+  useEffect(() => {
+    const saved = window.localStorage.getItem('downloadDir');
+    if (saved) setDownloadDir(saved);
+  }, []);
+
+  const handleBrowse = async () => {
+    setBrowsing(true);
+    setError('');
+    try {
+      const response = await fetch('/api/browse', { method: 'POST' });
+      const data = await response.json();
+      if (data.path) {
+        setDownloadDir(data.path);
+        window.localStorage.setItem('downloadDir', data.path);
+        setShowManualPath(false);
+      } else if (data.error) {
+        throw new Error(`${data.error}: ${data.details || ''}`);
+      }
+    } catch (err) {
+      const msg = getErrorMessage(err, 'Failed to open folder picker');
+      setError(msg);
+      setShowManualPath(true);
+    } finally {
+      setBrowsing(false);
+    }
   };
 
   const validateUrl = (input: string) => {
@@ -381,35 +400,44 @@ export default function Home() {
             </div>
 
             <div>
-              <input
-                id="downloadDir"
-                type="text"
-                value={downloadDir}
-                onChange={handleDownloadDirChange}
-                placeholder="Download folder path"
-                style={{
-                  width: '100%',
+              <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                <div style={{
+                  flex: 1,
                   padding: '16px 20px',
                   fontSize: '14px',
                   fontWeight: '500',
                   borderRadius: '18px',
                   border: '1px solid rgba(255,255,255,0.1)',
-                  outline: 'none',
                   backgroundColor: 'rgba(255,255,255,0.03)',
-                  color: '#ffffff',
-                  boxSizing: 'border-box',
-                  transition: 'all 0.3s ease',
-                  textAlign: 'center'
-                }}
-                onFocus={(e) => {
-                  e.currentTarget.style.border = '1px solid rgba(255, 0, 51, 0.5)';
-                  e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.05)';
-                }}
-                onBlur={(e) => {
-                  e.currentTarget.style.border = '1px solid rgba(255,255,255,0.1)';
-                  e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.03)';
-                }}
-              />
+                  color: downloadDir ? '#ffffff' : '#666',
+                  textAlign: 'left',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap'
+                }}>
+                  {downloadDir || 'No destination selected'}
+                </div>
+                <button
+                  onClick={handleBrowse}
+                  disabled={browsing || loading || downloadingAll}
+                  style={{
+                    padding: '16px 24px',
+                    fontSize: '14px',
+                    fontWeight: '700',
+                    borderRadius: '18px',
+                    border: 'none',
+                    backgroundColor: 'rgba(255,255,255,0.08)',
+                    color: '#ffffff',
+                    cursor: 'pointer',
+                    transition: 'all 0.3s',
+                    whiteSpace: 'nowrap'
+                  }}
+                  onMouseOver={(e) => e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.12)'}
+                  onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.08)'}
+                >
+                  {browsing ? 'Choosing...' : 'Browse'}
+                </button>
+              </div>
               <div style={{
                 marginTop: '8px',
                 color: '#666',
@@ -417,8 +445,35 @@ export default function Home() {
                 textAlign: 'center',
                 fontWeight: 600
               }}>
-                Files are saved directly by the server. Relative paths stay inside this project.
+                Please select a folder where you want to save the mp3 files.
               </div>
+
+              {showManualPath && (
+                <div style={{ marginTop: '12px' }}>
+                  <input
+                    type="text"
+                    value={downloadDir}
+                    onChange={(e) => {
+                        setDownloadDir(e.target.value);
+                        window.localStorage.setItem('downloadDir', e.target.value);
+                    }}
+                    placeholder="Enter full path manually (e.g. C:\Downloads)"
+                    style={{
+                      width: '100%',
+                      padding: '14px 20px',
+                      fontSize: '13px',
+                      borderRadius: '15px',
+                      border: '1px solid rgba(255, 0, 51, 0.3)',
+                      backgroundColor: 'rgba(255,255,255,0.03)',
+                      color: '#fff',
+                      outline: 'none'
+                    }}
+                  />
+                  <div style={{ color: '#ff0033', fontSize: '11px', marginTop: '4px', textAlign: 'center' }}>
+                    Note: The automatic picker failed. Please paste the folder path above.
+                  </div>
+                </div>
+              )}
             </div>
 
             <div style={{ 
@@ -467,19 +522,19 @@ export default function Home() {
 
             <button
               onClick={handleFetch}
-              disabled={loading || downloadingAll || !url}
+              disabled={loading || downloadingAll || !url || !downloadDir}
               style={{
                 width: '100%',
                 padding: '22px',
                 fontSize: '16px',
                 fontWeight: '800',
-                background: loading || downloadingAll || !url ? '#1a1a1a' : 'linear-gradient(to right, #ff0033, #cc0022)',
-                color: loading || downloadingAll || !url ? '#444' : 'white',
+                background: loading || downloadingAll || !url || !downloadDir ? '#1a1a1a' : 'linear-gradient(to right, #ff0033, #cc0022)',
+                color: loading || downloadingAll || !url || !downloadDir ? '#444' : 'white',
                 border: 'none',
                 borderRadius: '24px',
-                cursor: loading || downloadingAll || !url ? 'not-allowed' : 'pointer',
+                cursor: loading || downloadingAll || !url || !downloadDir ? 'not-allowed' : 'pointer',
                 transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
-                boxShadow: loading || downloadingAll || !url ? 'none' : '0 15px 30px rgba(255, 0, 51, 0.25)',
+                boxShadow: loading || downloadingAll || !url || !downloadDir ? 'none' : '0 15px 30px rgba(255, 0, 51, 0.25)',
                 textTransform: 'uppercase',
                 letterSpacing: '1px'
               }}
