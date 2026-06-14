@@ -98,26 +98,52 @@ async function savePlaywrightDownload(download: Download, downloadDir: string, f
   };
 }
 
-async function clickConverterDownload(page: Page) {
-  const candidates = page.locator('.form__download a, .form__download button, a[href*="download"], button[class*="download"]');
-  const count = await candidates.count();
+async function safeClick(page: Page, selector: string | ReturnType<Page['locator']>, options: { timeout?: number; retries?: number } = {}) {
+  const { timeout = 10000, retries = 2 } = options;
+  const locator = typeof selector === 'string' ? page.locator(selector).first() : selector;
 
-  for (let i = 0; i < count; i += 1) {
-    const candidate = candidates.nth(i);
-    if (!(await candidate.isVisible().catch(() => false))) continue;
-
-    const text = (await candidate.textContent().catch(() => ''))?.toLowerCase() || '';
-    const href = await candidate.getAttribute('href').catch(() => null);
-    if (text.includes('download') || href) {
-      await candidate.click();
+  for (let i = 0; i <= retries; i++) {
+    try {
+      await locator.waitFor({ state: 'visible', timeout });
+      await locator.scrollIntoViewIfNeeded({ timeout });
+      await locator.click({ timeout });
       return true;
+    } catch (e) {
+      if (i === retries) throw e;
+      await new Promise(r => setTimeout(r, 1000));
     }
   }
+  return false;
+}
 
-  const firstVisible = page.locator('.form__download a:visible, .form__download button:visible').first();
-  if (await firstVisible.isVisible().catch(() => false)) {
-    await firstVisible.click();
-    return true;
+async function clickConverterDownload(page: Page) {
+  const selectors = [
+    '.form__download a',
+    '.form__download button',
+    'a[href*="download"]',
+    'button[class*="download"]',
+    'button:has-text("Download")',
+    'a:has-text("Download")'
+  ];
+
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    try {
+      if (await locator.isVisible()) {
+        const text = (await locator.textContent().catch(() => ''))?.toLowerCase() || '';
+        const href = await locator.getAttribute('href').catch(() => null);
+        
+        // Skip links that are likely ads or not the actual download
+        if (href && (href.includes('javascript') || href.startsWith('#'))) continue;
+
+        if (text.includes('download') || href) {
+          await safeClick(page, locator);
+          return true;
+        }
+      }
+    } catch (e) {
+      continue;
+    }
   }
 
   return false;
@@ -168,107 +194,159 @@ async function prepareConverterPage(page: Page) {
 }
 
 async function convertOne(page: Page, videoUrl: string, videoIndex: number, downloadDir: string): Promise<ConvertResult> {
-  await page.goto('https://yt2mp3.gs', { waitUntil: 'networkidle', timeout: 45000 });
-  await page.evaluate(() => {
-    window.__downloadURL = undefined;
-  });
+  // Ensure we have a clean video URL (no list/index params)
+  let cleanUrl = videoUrl;
+  try {
+    const u = new URL(videoUrl);
+    const v = u.searchParams.get('v');
+    if (v) {
+      cleanUrl = `https://www.youtube.com/watch?v=${v}`;
+    }
+  } catch {}
 
-  const mp3Btn = await page.$('.form__formats button:first-child');
-  if (mp3Btn) {
-    const isActive = await page.evaluate((el) => el.classList.contains('active'), mp3Btn);
-    if (!isActive) await mp3Btn.click();
-  }
+  const maxRetries = 2;
+  let lastError: Error | null = null;
 
-  await page.waitForSelector('input#video', { timeout: 15000 });
-  await page.click('input#video', { clickCount: 3 });
-  await page.keyboard.press('Backspace');
-  await page.type('input#video', videoUrl, { delay: 15 });
-  await page.click('button[type="submit"]');
-  await page.waitForSelector('.form__download', { timeout: 300000 });
-
-  const browserDownloadPromise = page.waitForEvent('download', { timeout: 20000 }).catch(() => null);
-  const clickedDownload = await clickConverterDownload(page);
-  if (!clickedDownload) {
-    throw new Error('Converter download button was not found.');
-  }
-
-  const browserDownload = await browserDownloadPromise;
-  if (browserDownload) {
-    return savePlaywrightDownload(browserDownload, downloadDir, `video_${videoIndex + 1}.mp3`);
-  }
-
-  let downloadUrl: string | null = null;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    downloadUrl = await page.evaluate(() => window.__downloadURL || null);
-    if (downloadUrl) break;
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-
-  if (!downloadUrl) {
-    throw new Error('Could not obtain download URL from converter.');
-  }
-
-  const fullDownloadUrl = await page.evaluate((baseUrl) => {
-    const section = document.querySelector('.form__download');
-    const videoId = section?.getAttribute('data-id') || '';
-    const fmtBtn = document.querySelector('.form__formats button.active');
-    const fmt = fmtBtn?.textContent?.trim().toLowerCase() || 'mp3';
-    return `${baseUrl}&v=${videoId}&f=${fmt}&r=${window.location.hostname}`;
-  }, downloadUrl);
-
-  const result = await page.evaluate(async (url) => {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const response = await fetch(url, {
-        headers: {
-          Accept: 'audio/webm,audio/ogg,audio/wav,audio/*;q=0.9,application/ogg;q=0.7,video/*;q=0.6,*/*;q=0.5',
-          'Accept-Language': 'en-US,en;q=0.9',
-          Range: 'bytes=0-',
-        },
-        credentials: 'omit',
+      if (attempt > 0) {
+        console.log(`Retry attempt ${attempt} for video ${videoIndex + 1}`);
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+
+      await page.goto('https://yt2mp3.gs', { waitUntil: 'networkidle', timeout: 60000 });
+      await page.evaluate(() => {
+        window.__downloadURL = undefined;
       });
 
-      if (!response.ok) {
-        return { error: `HTTP ${response.status}` };
+      // Clear any potential overlays or dialogs that might block clicks
+      await page.evaluate(() => {
+        const overlays = document.querySelectorAll('.modal, .overlay, .popup, [class*="modal"], [class*="popup"], #disclaimer, .consent-banner');
+        overlays.forEach(el => {
+          if ((el as HTMLElement).style) (el as HTMLElement).style.display = 'none';
+        });
+      });
+
+      const mp3Btn = page.locator('.form__formats button').first();
+      try {
+        await mp3Btn.waitFor({ state: 'visible', timeout: 5000 });
+        const isActive = await mp3Btn.evaluate((el) => el.classList.contains('active'));
+        if (!isActive) await safeClick(page, mp3Btn);
+      } catch {
+        // If MP3 button not found or already active, just continue
       }
 
-      const contentType = response.headers.get('content-type') || '';
-      if (contentType.includes('text/html') || contentType.includes('text/plain')) {
-        const text = await response.text();
-        return { error: `Unexpected response: ${text.slice(0, 200)}` };
+      await page.waitForSelector('input#video', { timeout: 20000 });
+      await page.click('input#video', { clickCount: 3 });
+      await page.keyboard.press('Backspace');
+      await page.type('input#video', cleanUrl, { delay: 10 });
+      
+      const submitBtn = page.locator('button[type="submit"]').first();
+      await safeClick(page, submitBtn);
+
+      // Wait for result or error with longer timeout
+      const resultOrError = await Promise.race([
+        page.waitForSelector('.form__download', { timeout: 300000 }).then(() => 'success'),
+        page.waitForSelector('.error, .alert-danger, #error', { timeout: 45000 }).then(() => 'error').catch(() => null),
+        page.evaluate(async () => {
+          for (let i = 0; i < 45; i++) {
+            const text = document.body.innerText.toLowerCase();
+            if (text.includes('invalid link') || text.includes('error occurred') || text.includes('not supported') || text.includes('too large')) return 'error';
+            await new Promise(r => setTimeout(r, 1000));
+          }
+          return null;
+        })
+      ]);
+
+      if (resultOrError === 'error') {
+        const errorMsg = await page.evaluate(() => {
+          const el = document.querySelector('.error, .alert-danger, #error');
+          return el?.textContent?.trim() || 'Invalid link or converter error';
+        });
+        throw new Error(errorMsg);
       }
 
-      const contentDisposition = response.headers.get('content-disposition') || '';
-      const buffer = await response.arrayBuffer();
-      return {
-        data: Array.from(new Uint8Array(buffer)),
-        contentDisposition,
-      };
-    } catch (err: unknown) {
-      return { error: err instanceof Error ? err.message : 'Fetch failed' };
+      // Wait for the download section to be fully ready
+      await page.waitForSelector('.form__download', { state: 'visible', timeout: 300000 });
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      const browserDownloadPromise = page.waitForEvent('download', { timeout: 45000 }).catch(() => null);
+      const clickedDownload = await clickConverterDownload(page);
+      
+      if (!clickedDownload) {
+        // Fallback: try obtaining the URL from the window property
+        let downloadUrl: string | null = null;
+        for (let j = 0; j < 60; j++) {
+          downloadUrl = await page.evaluate(() => window.__downloadURL || null);
+          if (downloadUrl) break;
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+
+        if (downloadUrl) {
+          const fullDownloadUrl = await page.evaluate((baseUrl) => {
+            const section = document.querySelector('.form__download');
+            const videoId = section?.getAttribute('data-id') || '';
+            const fmtBtn = document.querySelector('.form__formats button.active');
+            const fmt = fmtBtn?.textContent?.trim().toLowerCase() || 'mp3';
+            return `${baseUrl}&v=${videoId}&f=${fmt}&r=${window.location.hostname}`;
+          }, downloadUrl);
+
+          const fetchResult = await page.evaluate(async (url) => {
+            try {
+              const response = await fetch(url, {
+                headers: {
+                  Accept: 'audio/webm,audio/ogg,audio/wav,audio/*;q=0.9,application/ogg;q=0.7,video/*;q=0.6,*/*;q=0.5',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                  Range: 'bytes=0-',
+                },
+                credentials: 'omit',
+              });
+
+              if (!response.ok) return { error: `HTTP ${response.status}` };
+              
+              const contentType = response.headers.get('content-type') || '';
+              if (contentType.includes('text/html')) return { error: 'Unexpected HTML response' };
+
+              const buffer = await response.arrayBuffer();
+              return {
+                data: Array.from(new Uint8Array(buffer)),
+                contentDisposition: response.headers.get('content-disposition') || '',
+              };
+            } catch (err: any) {
+              return { error: err.message || 'Fetch failed' };
+            }
+          }, fullDownloadUrl);
+
+          if (fetchResult.error) throw new Error(fetchResult.error);
+
+          const fileBuffer = Buffer.from(fetchResult.data!);
+          const cdMatch = fetchResult.contentDisposition?.match(/filename\*?=(?:UTF-8''|")?([^";]+)"?/i);
+          const rawName = cdMatch ? decodeURIComponent(cdMatch[1]) : `video_${videoIndex + 1}.mp3`;
+          const filePath = await uniqueFilePath(downloadDir, rawName);
+          await fs.ensureDir(downloadDir);
+          await fs.writeFile(filePath, fileBuffer);
+
+          return { fileName: path.basename(filePath), filePath, bytes: fileBuffer.length };
+        }
+        
+        throw new Error('Could not obtain download link after successful conversion.');
+      }
+
+      const browserDownload = await browserDownloadPromise;
+      if (browserDownload) {
+        return savePlaywrightDownload(browserDownload, downloadDir, `video_${videoIndex + 1}.mp3`);
+      }
+
+      throw new Error('Conversion finished but download did not start.');
+
+    } catch (error: any) {
+      lastError = error;
+      console.error(`Attempt ${attempt + 1} failed for video ${videoIndex + 1}:`, error.message);
+      if (attempt === maxRetries) throw error;
     }
-  }, fullDownloadUrl);
-
-  if (result.error) {
-    throw new Error(result.error);
   }
 
-  const fileBuffer = Buffer.from(result.data!);
-  if (fileBuffer.length < 100) {
-    throw new Error(`Downloaded file too small (${fileBuffer.length} bytes).`);
-  }
-
-  const cdMatch = result.contentDisposition?.match(/filename\*?=(?:UTF-8''|")?([^";]+)"?/i);
-  const rawName = cdMatch ? decodeURIComponent(cdMatch[1]) : `video_${videoIndex + 1}.mp3`;
-  const filePath = await uniqueFilePath(downloadDir, rawName);
-
-  await fs.ensureDir(downloadDir);
-  await fs.writeFile(filePath, fileBuffer);
-
-  return {
-    fileName: path.basename(filePath),
-    filePath,
-    bytes: fileBuffer.length,
-  };
+  throw lastError || new Error('Unknown error');
 }
 
 function streamEvent(controller: ReadableStreamDefaultController<Uint8Array>, payload: unknown) {
@@ -343,6 +421,11 @@ export async function POST(req: NextRequest) {
             if (videos[i].status) {
               streamEvent(controller, { type: 'skip', index: i });
               continue;
+            }
+
+            // Small cooldown between videos to prevent browser lag
+            if (i > 0) {
+              await new Promise(r => setTimeout(r, 2000));
             }
 
             streamEvent(controller, { type: 'progress', index: i, status: 'converting', name: videos[i].name });
