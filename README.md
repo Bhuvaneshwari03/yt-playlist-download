@@ -98,6 +98,7 @@ Contributions are welcome! If you have a feature request, bug report, or a pull 
 4. Push to the Branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
 
+---
 
 ## ⚠️ Disclaimer
 
@@ -106,4 +107,4 @@ This tool is for **educational purposes only**. Please ensure you have the right
 ---
 
 
-Built with ❤️ by Bhuvaneshwari G and special thanks to **Saksham Agarwal** ([sakshamagarwalm2](https://github.com/sakshamagarwalm2)) 
+Built with ❤️ by **Bhuvaneshwari G** and special thanks to **Saksham Agarwal** ([sakshamagarwalm2](https://github.com/sakshamagarwalm2)) 
