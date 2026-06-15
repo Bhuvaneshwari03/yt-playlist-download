@@ -27,7 +27,7 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 export default function Home() {
-  const [url, setUrl] = useState('');
+  const [urls, setUrls] = useState<string[]>(['']);
   const [type, setType] = useState<'playlist' | 'video'>('playlist');
   const [loading, setLoading] = useState(false);
   const [scrapeProgress, setScrapeProgress] = useState('');
@@ -71,7 +71,6 @@ export default function Home() {
 
   const validateUrl = (input: string) => {
     if (!input) {
-      setError('');
       return true;
     }
     // Stricter regex: must be a valid youtube domain, and if protocol exists, it must be http/https
@@ -79,24 +78,49 @@ export default function Home() {
     const protocolCheck = input.includes('://') && !input.startsWith('http://') && !input.startsWith('https://');
     
     if (protocolCheck || !youtubeRegex.test(input)) {
-      setError('Please enter a valid YouTube URL (e.g., https://youtube.com/...)');
       return false;
     }
-    setError('');
     return true;
   };
 
-  const handleUrlChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value;
-    setUrl(value);
-    validateUrl(value);
+  const handleUrlChange = (index: number, value: string) => {
+    const newUrls = [...urls];
+    newUrls[index] = value;
+    setUrls(newUrls);
+    
+    if (value && !validateUrl(value)) {
+      setError('Please enter a valid YouTube URL (e.g., https://youtube.com/...)');
+    } else {
+      setError('');
+    }
+  };
+
+  const addUrlField = () => {
+    setUrls([...urls, '']);
+  };
+
+  const removeUrlField = (index: number) => {
+    if (urls.length > 1) {
+      const newUrls = urls.filter((_, i) => i !== index);
+      setUrls(newUrls);
+    }
   };
 
   const handleFetch = async () => {
-    if (!validateUrl(url)) return;
+    const validUrls = urls.filter(u => u.trim() !== '');
+    if (validUrls.length === 0) {
+      setError('Please enter at least one YouTube URL');
+      return;
+    }
+
+    for (const u of validUrls) {
+      if (!validateUrl(u)) {
+        setError(`Invalid URL: ${u}`);
+        return;
+      }
+    }
 
     setLoading(true);
-    setScrapeProgress('Opening browser...');
     setDownloadAllProgress('');
     setScrapedData([]);
     setScrapedFile(null);
@@ -105,63 +129,69 @@ export default function Home() {
     const foundVideos: VideoItem[] = [];
 
     try {
-      const response = await fetch('/api/scrape', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, type }),
-      });
+      for (let i = 0; i < validUrls.length; i++) {
+        const url = validUrls[i];
+        setScrapeProgress(`Scraping URL ${i + 1}/${validUrls.length}: Opening browser...`);
+        
+        const response = await fetch('/api/scrape', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, type }),
+        });
 
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({ error: 'Scraping failed' }));
-        setError(err.error || 'Scraping failed');
-        setLoading(false);
-        return;
-      }
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({ error: `Scraping failed for URL ${i + 1}` }));
+          setError(err.error || `Scraping failed for URL ${i + 1}`);
+          continue; // Move to next URL even if one fails
+        }
 
-      const contentType = response.headers.get('content-type') || '';
-      if (!contentType.includes('ndjson')) {
-        setError('Unexpected response format');
-        setLoading(false);
-        return;
-      }
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.includes('ndjson')) {
+          setError(`Unexpected response format for URL ${i + 1}`);
+          continue;
+        }
 
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
+        const reader = response.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
 
-        for (const line of lines) {
-          if (!line) continue;
+          for (const line of lines) {
+            if (!line) continue;
 
-          if (line.startsWith('__DONE__:')) {
-            const filename = line.slice('__DONE__:'.length).trim();
-            setScrapedFile(filename);
-            scrapedFileRef.current = filename;
-            setScrapeProgress(`Scraping complete. Starting downloads for ${foundVideos.length} item(s)...`);
-            if (foundVideos.length > 0) {
-              await downloadAll(foundVideos, filename);
+            if (line.startsWith('__DONE__:')) {
+              const filename = line.slice('__DONE__:'.length).trim();
+              setScrapedFile(filename);
+              scrapedFileRef.current = filename;
+            } else if (line.startsWith('__ERROR__:')) {
+              const msg = line.slice('__ERROR__:'.length);
+              setError(msg);
+            } else {
+              try {
+                const video = JSON.parse(line) as { name?: string; url?: string };
+                if (!video.url) continue;
+                const item = { name: video.name || 'Unknown', url: video.url, status: false, downloadStatus: 'fetched' as DownloadStatus };
+                foundVideos.push(item);
+                setScrapedData(prev => [...prev, item]);
+                setScrapeProgress(`URL ${i + 1}/${validUrls.length}: Found ${foundVideos.length}: ${video.name ? video.name.slice(0, 40) : 'video'}...`);
+              } catch {}
             }
-          } else if (line.startsWith('__ERROR__:')) {
-            const msg = line.slice('__ERROR__:'.length);
-            setError(msg);
-          } else {
-            try {
-              const video = JSON.parse(line) as { name?: string; url?: string };
-              if (!video.url) continue;
-              const item = { name: video.name || 'Unknown', url: video.url, status: false, downloadStatus: 'fetched' as DownloadStatus };
-              foundVideos.push(item);
-              setScrapedData(prev => [...prev, item]);
-              setScrapeProgress(`Found ${foundVideos.length}: ${video.name ? video.name.slice(0, 40) : 'video'}...`);
-            } catch {}
           }
         }
+      }
+
+      if (foundVideos.length > 0) {
+        setScrapeProgress(`Scraping complete. Starting downloads for ${foundVideos.length} item(s)...`);
+        await downloadAll(foundVideos, scrapedFileRef.current);
+      } else if (!error) {
+        setError('No videos found in any of the provided links.');
       }
     } catch (err) {
       setError('Connection failed. Is the server running?');
@@ -173,8 +203,8 @@ export default function Home() {
   };
 
   const downloadAll = async (items: VideoItem[], file: string | null) => {
-    if (!file) {
-      setError('No scraped data to download');
+    if (items.length === 0) {
+      setError('No videos to download');
       return;
     }
 
@@ -192,7 +222,7 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           videos: items,
-          jsonFilename: file,
+          jsonFilename: file || undefined,
           downloadDir,
         }),
       });
@@ -365,38 +395,95 @@ export default function Home() {
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
-            <div>
-              <input
-                id="url"
-                type="text"
-                value={url}
-                onChange={handleUrlChange}
-                placeholder="Enter YouTube Link"
-                style={{ 
-                  width: '100%', 
-                  padding: '20px 24px', 
-                  fontSize: '16px',
-                  fontWeight: '500',
-                  borderRadius: '20px',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  outline: 'none',
-                  backgroundColor: 'rgba(255,255,255,0.03)',
-                  color: '#ffffff',
-                  boxSizing: 'border-box',
-                  transition: 'all 0.3s ease',
-                  textAlign: 'center'
-                }}
-                onFocus={(e) => {
-                  e.currentTarget.style.border = '1px solid rgba(255, 0, 51, 0.5)';
-                  e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.05)';
-                  e.currentTarget.style.boxShadow = '0 0 200px rgba(255, 0, 51, 0.05)';
-                }}
-                onBlur={(e) => {
-                  e.currentTarget.style.border = '1px solid rgba(255,255,255,0.1)';
-                  e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.03)';
-                  e.currentTarget.style.boxShadow = 'none';
-                }}
-              />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              {urls.map((url, index) => (
+                <div key={index} style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                  <div style={{ flex: 1, position: 'relative' }}>
+                    <input
+                      type="text"
+                      value={url}
+                      onChange={(e) => handleUrlChange(index, e.target.value)}
+                      placeholder="Enter YouTube Link"
+                      style={{ 
+                        width: '100%', 
+                        padding: '18px 24px', 
+                        fontSize: '15px',
+                        fontWeight: '500',
+                        borderRadius: '20px',
+                        border: '1px solid rgba(255,255,255,0.1)',
+                        outline: 'none',
+                        backgroundColor: 'rgba(255,255,255,0.03)',
+                        color: '#ffffff',
+                        boxSizing: 'border-box',
+                        transition: 'all 0.3s ease',
+                      }}
+                      onFocus={(e) => {
+                        e.currentTarget.style.border = '1px solid rgba(255, 0, 51, 0.5)';
+                        e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.05)';
+                      }}
+                      onBlur={(e) => {
+                        e.currentTarget.style.border = '1px solid rgba(255,255,255,0.1)';
+                        e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.03)';
+                      }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    {urls.length > 1 && (
+                      <button
+                        onClick={() => removeUrlField(index)}
+                        title="Remove URL"
+                        style={{
+                          width: '52px',
+                          height: '52px',
+                          borderRadius: '18px',
+                          border: 'none',
+                          backgroundColor: 'rgba(255, 0, 51, 0.1)',
+                          color: '#ff0033',
+                          display: 'flex',
+                          justifyContent: 'center',
+                          alignItems: 'center',
+                          cursor: 'pointer',
+                          transition: 'all 0.2s',
+                        }}
+                        onMouseOver={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 0, 51, 0.2)'}
+                        onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 0, 51, 0.1)'}
+                      >
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                          <line x1="18" y1="6" x2="6" y2="18"></line>
+                          <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                      </button>
+                    )}
+                    {index === urls.length - 1 && (
+                      <button
+                        onClick={addUrlField}
+                        title="Add another URL"
+                        style={{
+                          width: '52px',
+                          height: '52px',
+                          borderRadius: '18px',
+                          border: 'none',
+                          backgroundColor: 'rgba(255, 255, 255, 0.08)',
+                          color: 'white',
+                          display: 'flex',
+                          justifyContent: 'center',
+                          alignItems: 'center',
+                          cursor: 'pointer',
+                          transition: 'all 0.2s',
+                          boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
+                        }}
+                        onMouseOver={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.15)'}
+                        onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.08)'}
+                      >
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                          <line x1="12" y1="5" x2="12" y2="19"></line>
+                          <line x1="5" y1="12" x2="19" y2="12"></line>
+                        </svg>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
 
             <div>
@@ -522,19 +609,19 @@ export default function Home() {
 
             <button
               onClick={handleFetch}
-              disabled={loading || downloadingAll || !url || !downloadDir}
+              disabled={loading || downloadingAll || urls.every(u => !u) || !downloadDir}
               style={{
                 width: '100%',
                 padding: '22px',
                 fontSize: '16px',
                 fontWeight: '800',
-                background: loading || downloadingAll || !url || !downloadDir ? '#1a1a1a' : 'linear-gradient(to right, #ff0033, #cc0022)',
-                color: loading || downloadingAll || !url || !downloadDir ? '#444' : 'white',
+                background: loading || downloadingAll || urls.every(u => !u) || !downloadDir ? '#1a1a1a' : 'linear-gradient(to right, #ff0033, #cc0022)',
+                color: loading || downloadingAll || urls.every(u => !u) || !downloadDir ? '#444' : 'white',
                 border: 'none',
                 borderRadius: '24px',
-                cursor: loading || downloadingAll || !url || !downloadDir ? 'not-allowed' : 'pointer',
+                cursor: loading || downloadingAll || urls.every(u => !u) || !downloadDir ? 'not-allowed' : 'pointer',
                 transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
-                boxShadow: loading || downloadingAll || !url || !downloadDir ? 'none' : '0 15px 30px rgba(255, 0, 51, 0.25)',
+                boxShadow: loading || downloadingAll || urls.every(u => !u) || !downloadDir ? 'none' : '0 15px 30px rgba(255, 0, 51, 0.25)',
                 textTransform: 'uppercase',
                 letterSpacing: '1px'
               }}
